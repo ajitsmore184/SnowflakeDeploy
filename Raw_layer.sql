@@ -1,6 +1,8 @@
 ----------------------------------------------------------------------
 -- 2. RAW LAYER + STREAM
 ----------------------------------------------------------------------
+
+--select * from CITIBIKE_DB.RAW.TRIPS_RAW
 CREATE OR REPLACE TABLE raw.trips_raw (
   tripduration            INT,
   starttime               TIMESTAMP_NTZ,
@@ -26,7 +28,9 @@ CREATE OR REPLACE STREAM raw.trips_raw_stream
   ON TABLE raw.trips_raw
   APPEND_ONLY = TRUE;
 
-
+SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18
+FROM @raw.ext_citibike_stage/2020/data_0_0_0.csv.gz (FILE_FORMAT => 'raw.ff_csv')
+LIMIT 5;
 ----------------------------------------------------------------------
 -- 3. STAGING LAYER (cleansed, deduped batch from stream)
 ----------------------------------------------------------------------

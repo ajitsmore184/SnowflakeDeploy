@@ -3,49 +3,138 @@ J
 	README.md## the snowflake
 *
 ³á× d9d206e37959de0b3b25ff92774917a4
-î
-MONITORING.sql¯----------------------------------------------------------------------
--- 8. MONITORING
+ñ
+Raw_layer.sql³----------------------------------------------------------------------
+-- 2. RAW LAYER + STREAM
 ----------------------------------------------------------------------
--- Task runs
-SELECT name, state, scheduled_time, completed_time, error_message
-FROM TABLE(citibike_db.INFORMATION_SCHEMA.TASK_HISTORY(
-       SCHEDULED_TIME_RANGE_START => DATEADD('hour', -2, CURRENT_TIMESTAMP())))
-ORDER BY scheduled_time DESC;
+CREATE OR REPLACE TABLE raw.trips_raw (
+  tripduration            INT,
+  starttime               TIMESTAMP_NTZ,
+  stoptime                TIMESTAMP_NTZ,
+  start_station_id        INT,
+  start_station_latitude  FLOAT,
+  start_station_longitude FLOAT,
+  end_station_id          INT,
+  end_station_latitude    FLOAT,
+  end_station_longitude   FLOAT,
+  bikeid                  INT,
+  membership_type         STRING,
+  usertype                STRING,
+  birth_year              INT,
+  gender                  INT,
+  src_file                STRING,
+  src_row                 NUMBER,
+  load_ts                 TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP()
+);
 
--- Dynamic table refreshes
-SELECT name, state, refresh_action, data_timestamp, refresh_trigger
-FROM TABLE(citibike_db.INFORMATION_SCHEMA.DYNAMIC_TABLE_REFRESH_HISTORY())
-ORDER BY data_timestamp DESC
-LIMIT 20;
+-- Append-only stream: captures only new rows inserted by COPY
+CREATE OR REPLACE STREAM raw.trips_raw_stream
+  ON TABLE raw.trips_raw
+  APPEND_ONLY = TRUE;
 
--- Row counts across layers
-SELECT 'raw'      AS layer, COUNT(*) FROM raw.trips_raw
-UNION ALL SELECT 'staging', COUNT(*) FROM staging.trips_clean
-UNION ALL SELECT 'fact',    COUNT(*) FROM core.fact_trips
-UNION ALL SELECT 'dim_station', COUNT(*) FROM core.dim_station
-UNION ALL SELECT 'dim_user',    COUNT(*) FROM core.dim_user;
+SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18
+FROM @raw.ext_citibike_stage/2020/data_0_0_0.csv.gz (FILE_FORMAT => 'raw.ff_csv')
+LIMIT 5;
+----------------------------------------------------------------------
+-- 3. STAGING LAYER (cleansed, deduped batch from stream)
+----------------------------------------------------------------------
+CREATE OR REPLACE TABLE staging.trips_clean (
+  trip_id                 STRING,
+  tripduration            INT,
+  starttime               TIMESTAMP_NTZ,
+  stoptime                TIMESTAMP_NTZ,
+  start_station_id        INT,
+  start_station_latitude  FLOAT,
+  start_station_longitude FLOAT,
+  end_station_id          INT,
+  end_station_latitude    FLOAT,
+  end_station_longitude   FLOAT,
+  bikeid                  INT,
+  membership_type         STRING,
+  usertype                STRING,
+  birth_year              INT,
+  gender                  INT,
+  load_ts                 TIMESTAMP_LTZ
+);
+
+
+=================================
+
+----------------------------------------------------------------------
+-- 4. STAR SCHEMA
+----------------------------------------------------------------------
+CREATE OR REPLACE TABLE core.dim_date (
+  date_key     INT PRIMARY KEY,        -- YYYYMMDD
+  full_date    DATE,
+  year         INT,
+  quarter      INT,
+  month        INT,
+  month_name   STRING,
+  day          INT,
+  day_of_week  INT,
+  day_name     STRING,
+  is_weekend   BOOLEAN
+);
+
+-- Static dimension: generate ~11 years of dates
+INSERT INTO core.dim_date
+SELECT
+  TO_NUMBER(TO_CHAR(d,'YYYYMMDD')),
+  d,
+  YEAR(d), QUARTER(d), MONTH(d), MONTHNAME(d), DAY(d),
+  DAYOFWEEKISO(d), DAYNAME(d),
+  DAYOFWEEKISO(d) IN (6,7)
+FROM (
+  SELECT DATEADD(day, SEQ4(), '2013-01-01'::DATE) AS d
+  FROM TABLE(GENERATOR(ROWCOUNT => 4000))
+);
+
+CREATE OR REPLACE TABLE core.dim_station (
+  station_key  INT AUTOINCREMENT PRIMARY KEY,
+  station_id   INT,
+  latitude     FLOAT,
+  longitude    FLOAT,
+  created_at   TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP(),
+  updated_at   TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP()
+);
+
+CREATE OR REPLACE TABLE core.dim_user (
+  user_key         INT AUTOINCREMENT PRIMARY KEY,
+  membership_type  STRING,
+  usertype         STRING,
+  gender           INT,
+  gender_desc      STRING
+);
+
+
+CREATE OR REPLACE TABLE core.fact_trips (
+  trip_id             STRING PRIMARY KEY,
+  date_key            INT,
+  start_station_key   INT,
+  end_station_key     INT,
+  user_key            INT,
+  start_ts            TIMESTAMP_NTZ,
+  stop_ts             TIMESTAMP_NTZ,
+  trip_duration_sec   INT,
+  bike_id             INT,
+  rider_age           INT,
+  load_ts             TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP()
+);
 *
-´—á× 8b01e68609bf9cdf9e9bbf44f528fc00
-Ü
-ANALYTICS.sqlž---------------------------------------------------------------------
--- 9. ANALYTICS ON THE STAR SCHEMA / MARTS
-----------------------------------------------------------------------
--- Weekday vs weekend, by user type
-SELECT is_weekend, usertype, SUM(trips) AS trips, ROUND(AVG(avg_minutes),1) AS avg_min
-FROM mart.dt_daily_trips
-GROUP BY ALL ORDER BY 1,2;
+Þ£á× 7ee7020ddfe663e8e95efcbe3eeaf971
+ÿ
+Untitled.sqlÂALTER TASK CITIBIKE_DB.staging.t_load_staging  SUSPEND;   -- root first
+ALTER TASK CITIBIKE_DB.staging.t_load_dim_station SUSPEND;
+ALTER TASK CITIBIKE_DB.staging.t_load_dim_user    SUSPEND;
+ALTER TASK CITIBIKE_DB.staging.t_load_fact_trips  SUSPEND;
+ALTER DYNAMIC TABLE CITIBIKE_DB.mart.dt_daily_trips   SUSPEND;
+ALTER DYNAMIC TABLE CITIBIKE_DB.mart.dt_station_usage SUSPEND;
+ALTER DYNAMIC TABLE CITIBIKE_DB.mart.dt_station_rank  SUSPEND;
 
--- Top 10 stations in each month
-SELECT * FROM mart.dt_station_rank WHERE rnk <= 10 ORDER BY year, month, rnk;
-
--- Classic star-join: busiest days
-SELECT d.full_date, d.day_name, COUNT(*) AS trips
-FROM core.fact_trips f JOIN core.dim_date d ON d.date_key = f.date_key
-GROUP BY ALL ORDER BY trips DESC LIMIT 10;*
-«—á× 5938d3717b6d0935c2430f68165cb387
-¼
-Data_Loading.sqlû----------------------------------------------------------------------
+CITIBIKE_DB*
+«£á× 1efc640793e8e14ce757d2ed1eb87efb
+†
+Data_Loading.sqlÅ----------------------------------------------------------------------
 -- 7. LOAD DATA IN BATCHES (simulates incremental arrival)
 --    Run LIST above and adjust PATTERN to match real file names.
 ----------------------------------------------------------------------
@@ -59,8 +148,12 @@ FROM (
          METADATA$FILENAME, METADATA$FILE_ROW_NUMBER
   FROM @raw.ext_citibike_stage
 )
-PATTERN = '.*trips_2018_1_.*'
+PATTERN = '.*2020/data_0_0_.*'
 ON_ERROR = 'CONTINUE';
+
+
+
+s3://snowflake-workshop-lab/citibike-trips-csv/2020/data_0_0_0.csv.gz
 
 SELECT COUNT(*) FROM raw.trips_raw;
 SELECT SYSTEM$STREAM_HAS_DATA('raw.trips_raw_stream');   -- TRUE
@@ -81,58 +174,9 @@ FROM (
 PATTERN = '.*trips_2018_2_.*'
 ON_ERROR = 'CONTINUE';
 -- Now let the 5-minute schedule pick it up and watch it work.*
-Œ–á× 3114e64bb5498d81512059e0fbad9deb
-Õ
-DT.sqlž----------------------------------------------------------------------
--- 6. DYNAMIC TABLES (declarative marts on top of the star schema)
-----------------------------------------------------------------------
--- Level 1: daily trips by user type
-CREATE OR REPLACE DYNAMIC TABLE mart.dt_daily_trips
-  TARGET_LAG = '5 minutes'
-  WAREHOUSE  = practice_wh
-AS
-SELECT
-  d.full_date, d.year, d.month_name, d.day_name, d.is_weekend,
-  u.usertype, u.gender_desc,
-  COUNT(*)                         AS trips,
-  SUM(f.trip_duration_sec) / 60    AS total_minutes,
-  AVG(f.trip_duration_sec) / 60    AS avg_minutes,
-  AVG(f.rider_age)                 AS avg_rider_age
-FROM core.fact_trips f
-JOIN core.dim_date d ON d.date_key = f.date_key
-JOIN core.dim_user u ON u.user_key = f.user_key
-GROUP BY ALL;
-
--- Level 2a: station usage (intermediate, refreshes only when needed downstream)
-CREATE OR REPLACE DYNAMIC TABLE mart.dt_station_usage
-  TARGET_LAG = DOWNSTREAM
-  WAREHOUSE  = practice_wh
-AS
-SELECT
-  s.station_id, s.latitude, s.longitude,
-  d.year, d.month,
-  COUNT(*)                       AS trips_started,
-  AVG(f.trip_duration_sec) / 60  AS avg_minutes
-FROM core.fact_trips f
-JOIN core.dim_station s ON s.station_key = f.start_station_key
-JOIN core.dim_date d    ON d.date_key    = f.date_key
-GROUP BY ALL;
-
--- Level 3: ranking chained on top of Level 2a
-CREATE OR REPLACE DYNAMIC TABLE mart.dt_station_rank
-  TARGET_LAG = '10 minutes'
-  WAREHOUSE  = practice_wh
-AS
-SELECT
-  year, month, station_id, trips_started,
-  RANK() OVER (PARTITION BY year, month ORDER BY trips_started DESC) AS rnk
-FROM mart.dt_station_usage;
-
-SHOW DYNAMIC TABLES IN SCHEMA mart;   -- check refresh_mode (INCREMENTAL / FULL)
-*
-Ç•á× 05504fa4f5b87f0f44203e3d14a1ee76
-Õ"
-	Tasks.sql›"----------------------------------------------------------------------
+® á× c36ec8dd8b35b0e000ef7b4dcbc51990
+â"
+	Tasks.sql¨"----------------------------------------------------------------------
 -- 5. TASK GRAPH  (root consumes stream; children are dependent)
 --    NOTE: a stream can only be consumed once per DML, so the root task
 --    drains the stream into STAGING; children read STAGING, not the stream.
@@ -242,125 +286,100 @@ ALTER TASK citibike_db.staging.t_load_fact_trips  RESUME;
 ALTER TASK citibike_db.staging.t_load_dim_user    RESUME;
 ALTER TASK citibike_db.staging.t_load_dim_station RESUME;
 ALTER TASK citibike_db.staging.t_load_staging  RESUME;
+
+show tasks;
 *
-Š•á× 89d3d1b675d8719dca0d72391eb2b571
-Ñ
-Raw_layer.sql“----------------------------------------------------------------------
--- 2. RAW LAYER + STREAM
+­˜á× a7ec7ce3473df63a347f19955f308f04
+î
+MONITORING.sql¯----------------------------------------------------------------------
+-- 8. MONITORING
 ----------------------------------------------------------------------
-CREATE OR REPLACE TABLE raw.trips_raw (
-  tripduration            INT,
-  starttime               TIMESTAMP_NTZ,
-  stoptime                TIMESTAMP_NTZ,
-  start_station_id        INT,
-  start_station_latitude  FLOAT,
-  start_station_longitude FLOAT,
-  end_station_id          INT,
-  end_station_latitude    FLOAT,
-  end_station_longitude   FLOAT,
-  bikeid                  INT,
-  membership_type         STRING,
-  usertype                STRING,
-  birth_year              INT,
-  gender                  INT,
-  src_file                STRING,
-  src_row                 NUMBER,
-  load_ts                 TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP()
-);
+-- Task runs
+SELECT name, state, scheduled_time, completed_time, error_message
+FROM TABLE(citibike_db.INFORMATION_SCHEMA.TASK_HISTORY(
+       SCHEDULED_TIME_RANGE_START => DATEADD('hour', -2, CURRENT_TIMESTAMP())))
+ORDER BY scheduled_time DESC;
 
--- Append-only stream: captures only new rows inserted by COPY
-CREATE OR REPLACE STREAM raw.trips_raw_stream
-  ON TABLE raw.trips_raw
-  APPEND_ONLY = TRUE;
+-- Dynamic table refreshes
+SELECT name, state, refresh_action, data_timestamp, refresh_trigger
+FROM TABLE(citibike_db.INFORMATION_SCHEMA.DYNAMIC_TABLE_REFRESH_HISTORY())
+ORDER BY data_timestamp DESC
+LIMIT 20;
 
-
+-- Row counts across layers
+SELECT 'raw'      AS layer, COUNT(*) FROM raw.trips_raw
+UNION ALL SELECT 'staging', COUNT(*) FROM staging.trips_clean
+UNION ALL SELECT 'fact',    COUNT(*) FROM core.fact_trips
+UNION ALL SELECT 'dim_station', COUNT(*) FROM core.dim_station
+UNION ALL SELECT 'dim_user',    COUNT(*) FROM core.dim_user;
+*
+´—á× 8b01e68609bf9cdf9e9bbf44f528fc00
+Ü
+ANALYTICS.sqlž---------------------------------------------------------------------
+-- 9. ANALYTICS ON THE STAR SCHEMA / MARTS
 ----------------------------------------------------------------------
--- 3. STAGING LAYER (cleansed, deduped batch from stream)
+-- Weekday vs weekend, by user type
+SELECT is_weekend, usertype, SUM(trips) AS trips, ROUND(AVG(avg_minutes),1) AS avg_min
+FROM mart.dt_daily_trips
+GROUP BY ALL ORDER BY 1,2;
+
+-- Top 10 stations in each month
+SELECT * FROM mart.dt_station_rank WHERE rnk <= 10 ORDER BY year, month, rnk;
+
+-- Classic star-join: busiest days
+SELECT d.full_date, d.day_name, COUNT(*) AS trips
+FROM core.fact_trips f JOIN core.dim_date d ON d.date_key = f.date_key
+GROUP BY ALL ORDER BY trips DESC LIMIT 10;*
+«—á× 5938d3717b6d0935c2430f68165cb387
+Õ
+DT.sqlž----------------------------------------------------------------------
+-- 6. DYNAMIC TABLES (declarative marts on top of the star schema)
 ----------------------------------------------------------------------
-CREATE OR REPLACE TABLE staging.trips_clean (
-  trip_id                 STRING,
-  tripduration            INT,
-  starttime               TIMESTAMP_NTZ,
-  stoptime                TIMESTAMP_NTZ,
-  start_station_id        INT,
-  start_station_latitude  FLOAT,
-  start_station_longitude FLOAT,
-  end_station_id          INT,
-  end_station_latitude    FLOAT,
-  end_station_longitude   FLOAT,
-  bikeid                  INT,
-  membership_type         STRING,
-  usertype                STRING,
-  birth_year              INT,
-  gender                  INT,
-  load_ts                 TIMESTAMP_LTZ
-);
-
-
-=================================
-
-----------------------------------------------------------------------
--- 4. STAR SCHEMA
-----------------------------------------------------------------------
-CREATE OR REPLACE TABLE core.dim_date (
-  date_key     INT PRIMARY KEY,        -- YYYYMMDD
-  full_date    DATE,
-  year         INT,
-  quarter      INT,
-  month        INT,
-  month_name   STRING,
-  day          INT,
-  day_of_week  INT,
-  day_name     STRING,
-  is_weekend   BOOLEAN
-);
-
--- Static dimension: generate ~11 years of dates
-INSERT INTO core.dim_date
+-- Level 1: daily trips by user type
+CREATE OR REPLACE DYNAMIC TABLE mart.dt_daily_trips
+  TARGET_LAG = '5 minutes'
+  WAREHOUSE  = practice_wh
+AS
 SELECT
-  TO_NUMBER(TO_CHAR(d,'YYYYMMDD')),
-  d,
-  YEAR(d), QUARTER(d), MONTH(d), MONTHNAME(d), DAY(d),
-  DAYOFWEEKISO(d), DAYNAME(d),
-  DAYOFWEEKISO(d) IN (6,7)
-FROM (
-  SELECT DATEADD(day, SEQ4(), '2013-01-01'::DATE) AS d
-  FROM TABLE(GENERATOR(ROWCOUNT => 4000))
-);
+  d.full_date, d.year, d.month_name, d.day_name, d.is_weekend,
+  u.usertype, u.gender_desc,
+  COUNT(*)                         AS trips,
+  SUM(f.trip_duration_sec) / 60    AS total_minutes,
+  AVG(f.trip_duration_sec) / 60    AS avg_minutes,
+  AVG(f.rider_age)                 AS avg_rider_age
+FROM core.fact_trips f
+JOIN core.dim_date d ON d.date_key = f.date_key
+JOIN core.dim_user u ON u.user_key = f.user_key
+GROUP BY ALL;
 
-CREATE OR REPLACE TABLE core.dim_station (
-  station_key  INT AUTOINCREMENT PRIMARY KEY,
-  station_id   INT,
-  latitude     FLOAT,
-  longitude    FLOAT,
-  created_at   TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP(),
-  updated_at   TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP()
-);
+-- Level 2a: station usage (intermediate, refreshes only when needed downstream)
+CREATE OR REPLACE DYNAMIC TABLE mart.dt_station_usage
+  TARGET_LAG = DOWNSTREAM
+  WAREHOUSE  = practice_wh
+AS
+SELECT
+  s.station_id, s.latitude, s.longitude,
+  d.year, d.month,
+  COUNT(*)                       AS trips_started,
+  AVG(f.trip_duration_sec) / 60  AS avg_minutes
+FROM core.fact_trips f
+JOIN core.dim_station s ON s.station_key = f.start_station_key
+JOIN core.dim_date d    ON d.date_key    = f.date_key
+GROUP BY ALL;
 
-CREATE OR REPLACE TABLE core.dim_user (
-  user_key         INT AUTOINCREMENT PRIMARY KEY,
-  membership_type  STRING,
-  usertype         STRING,
-  gender           INT,
-  gender_desc      STRING
-);
+-- Level 3: ranking chained on top of Level 2a
+CREATE OR REPLACE DYNAMIC TABLE mart.dt_station_rank
+  TARGET_LAG = '10 minutes'
+  WAREHOUSE  = practice_wh
+AS
+SELECT
+  year, month, station_id, trips_started,
+  RANK() OVER (PARTITION BY year, month ORDER BY trips_started DESC) AS rnk
+FROM mart.dt_station_usage;
 
-
-CREATE OR REPLACE TABLE core.fact_trips (
-  trip_id             STRING PRIMARY KEY,
-  date_key            INT,
-  start_station_key   INT,
-  end_station_key     INT,
-  user_key            INT,
-  start_ts            TIMESTAMP_NTZ,
-  stop_ts             TIMESTAMP_NTZ,
-  trip_duration_sec   INT,
-  bike_id             INT,
-  rider_age           INT,
-  load_ts             TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP()
-);
+SHOW DYNAMIC TABLES IN SCHEMA mart;   -- check refresh_mode (INCREMENTAL / FULL)
 *
-»‘á× 8d1be710dfe18c0e16405e798d27dfcd
+Ç•á× 05504fa4f5b87f0f44203e3d14a1ee76
 À
 	SETUP.sql†USE ROLE ACCOUNTADMIN;
 GRANT EXECUTE TASK ON ACCOUNT TO ROLE SYSADMIN;   -- needed to run tasks
